@@ -83,28 +83,25 @@ with open(opt.xml, 'r') as f:
 if opt.hawkeye:
     if opt.nrespa > 1:
         raise ValueError('Cannot use MTS integrator and watch for errors')
-    groups_and_names = []
+    names_and_groups = []
     for i, force in enumerate(system.getForces()):
-#       if isinstance(force, mm.AmoebaMultipoleForce):
-#           # Skip the multipole force, since it's so expensive
-#           force.setForceGroup(20)
-#           continue
-        groups_and_names.append((type(force).__name__, i))
+        names_and_groups.append((type(force).__name__, i))
         force.setForceGroup(i)
-    
+
     class ErrorDetectionReporter(app.StateDataReporter):
-        def __init__(self, groups_and_names):
+        def __init__(self, names_and_groups):
             self._reportInterval = 1
-            self.groups_and_names = groups_and_names
+            self.names_and_groups = names_and_groups
+            self.energies = []
 
         def describeNextReport(self, simulation):
             """Get information about the next report this object will generate.
-    
+
             Parameters
             ----------
             simulation : Simulation
                 The Simulation to generate a report for
-    
+
             Returns
             -------
             tuple
@@ -117,14 +114,125 @@ if opt.hawkeye:
 
         def report(self, simulation, state):
             ene = state.getPotentialEnergy().value_in_unit(u.kilojoules_per_mole)
+            self.energies.append(ene)
             if not math.isnan(ene) and ene < 1e5:
                 return
             print('%30s %.6f kcal/mol' % ('Total Energy', ene))
-            for name, i in self.groups_and_names:
+            for name, i in self.names_and_groups:
                 ene = simulation.context.getState(getEnergy=True, groups=1<<i).getPotentialEnergy().value_in_unit(u.kilocalories_per_mole)
                 print('%30s %.6f kcal/mol' % (name, ene), file=sys.stderr)
             sys.exit('Bad energy! Look at components')
-    
+
+        def __del__(self):
+            # Dump the energies of all steps
+            with open('enedump.dat', 'w') as f:
+                for e in self.energies:
+                    print(e, file=f)
+
+    class EnergyDecompReporter(app.StateDataReporter):
+        """ Reports all energies for all components """
+        def __init__(self, filename, reportInterval, names_and_groups, separator='\t'):
+            """Create a StateDataReporter.
+
+            Parameters
+            ----------
+            filename : string or file
+                The file to write to, specified as a file name or file object
+            reportInterval : int
+                The interval (in time steps) at which to write frames
+            names_and_groups : list of tuple
+                List of all the groups and names for the energy components we want
+                to extract
+            separator : str, optional
+                Delimiter of data fields. Default is a tabstop
+            """
+            self._reportInterval = reportInterval
+            self._out = open(filename, 'w')
+            self.names_and_groups = names_and_groups
+            self._separator = separator
+
+        def describeNextReport(self, simulation):
+            """Get information about the next report this object will generate.
+
+            Parameters
+            ----------
+            simulation : Simulation
+                The Simulation to generate a report for
+
+            Returns
+            -------
+            tuple
+                A five element tuple. The first element is the number of steps
+                until the next report. The remaining elements specify whether
+                that report will require positions, velocities, forces, and
+                energies respectively.
+            """
+            steps = self._reportInterval - simulation.currentStep%self._reportInterval
+            return (steps, False, False, False, self._needEnergy)
+
+        def report(self, simulation, state):
+            """Generate a report.
+
+            Parameters
+            ----------
+            simulation : Simulation
+                The Simulation to generate a report for
+            state : State
+                The current state of the simulation
+            """
+            if not self._hasInitialized:
+                headers = self._constructHeaders()
+                print('#"%s"' % ('"'+self._separator+'"').join(headers), file=self._out)
+                try:
+                    self._out.flush()
+                except AttributeError:
+                    pass
+                self._hasInitialized = True
+
+            # Query for the values
+            values = self._constructReportValues(simulation, state)
+
+            # Write the values.
+            print(self._separator.join(str(v) for v in values), file=self._out)
+            try:
+                self._out.flush()
+            except AttributeError:
+                pass
+
+        def _constructReportValues(self, simulation, state):
+            """Query the simulation for the current state of our observables of interest.
+
+            Parameters
+            ----------
+            simulation : Simulation
+                The Simulation to generate a report for
+            state : State
+                The current state of the simulation
+
+            Returns
+            -------
+            A list of values summarizing the current state of
+            the simulation, to be printed or saved. Each element in the list
+            corresponds to one of the columns in the resulting CSV file.
+            """
+            values = [state.getPotentialEnergy().value_in_unit(u.kilojoules_per_mole)]
+            for name, i in self.names_and_groups:
+                values.append(
+                    simulation.context.getState(getEnergy=True, groups=1<<i).getPotentialEnergy().value_in_unit(u.kilocalories_per_mole)
+                )
+            return values
+
+        def _constructHeaders(self):
+            """Construct the headers for the CSV output
+
+            Returns: a list of strings giving the title of each observable being reported on.
+            """
+            return ['Total'] + [name for name, _ in self.names_and_groups]
+
+        def __del__(self):
+            if self._openedFile:
+                self._out.close()
+
 # Remove the andersen thermostat that might exist (e.g. from Tinker)
 for i in range(system.getNumForces()):
     if isinstance(system.getForce(i), mm.AndersenThermostat):
@@ -208,7 +316,11 @@ sim = app.Simulation(pdb.topology, system, integrator,
                      dict(CudaPrecision='mixed') )
 if opt.hawkeye:
     # Watch every step... slow!
-    sim.reporters.append(ErrorDetectionReporter(groups_and_names))
+    sim.reporters.append(ErrorDetectionReporter(names_and_groups))
+    sim.reporters.append(
+            EnergyDecompReporter(opt.output + '_Ecomponents.dat',
+                                 opt.interval, names_and_groups)
+    )
 
 sim.reporters.append(
         pmd.openmm.StateDataReporter(opt.output, reportInterval=opt.interval,
